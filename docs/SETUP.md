@@ -194,7 +194,8 @@ grant any Exchange permissions by itself; those follow in steps 7 and 8.
 
 `Sites.Selected` grants nothing until a site is explicitly granted. Grant **read** on the
 site that holds the list. The admin session needs the delegated permission
-`Sites.FullControl.All` for this call (this needs admin consent for Microsoft Graph PowerShell).
+`Sites.FullControl.All` for this call (this needs admin consent for Microsoft Graph PowerShell),
+and the signed-in admin must be a SharePoint Administrator (or higher) and a member of the site.
 
 ```powershell
 Connect-MgGraph -Scopes "Sites.FullControl.All"
@@ -226,7 +227,7 @@ User consent tab) cannot be revoked in the portal; remove the scope from the gra
 PowerShell instead:
 
 ```powershell
-Connect-MgGraph -Scopes "DelegatedPermissionGrant.ReadWrite.All"
+Connect-MgGraph -Scopes "DelegatedPermissionGrant.ReadWrite.All", "Application.Read.All"
 
 # Microsoft Graph Command Line Tools (the client behind Connect-MgGraph)
 $cli = Get-MgServicePrincipal -Filter "appId eq '14d82eec-204b-4c2f-b7e8-296a70dab67e'"
@@ -240,6 +241,9 @@ $g     = Get-MgOauth2PermissionGrant -OAuth2PermissionGrantId "<grant-id>"
 $scope = (($g.Scope -split ' ') | Where-Object { $_ -and $_ -ne 'Sites.FullControl.All' }) -join ' '
 Update-MgOauth2PermissionGrant -OAuth2PermissionGrantId $g.Id -BodyParameter @{ scope = $scope }
 ```
+
+If `Sites.FullControl.All` was the only scope in that grant, remove the grant instead with
+`Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId $g.Id`.
 
 ---
 
@@ -296,7 +300,7 @@ Application RBAC add up, so that would give access to every mailbox regardless o
 
 ---
 
-## 8. Exchange: narrow role for the scope group members
+## 8. Exchange: narrow custom role for the scope group members
 
 The script needs to add and remove members of the scope group, read recipients, and
 nothing else. A managed identity cannot be the owner (ManagedBy) of a group, so it uses
@@ -375,8 +379,8 @@ Invoke-AzRestMethod -Method PUT -Path "$rb`?$api" -Payload (@{
 ```
 
 Upload the script as draft content (content type `text/powershell`) and publish. With the
-Azure CLI (`az rest` is used here because this call needs the raw script file as the request
-body with content type `text/powershell`, and `az rest` sends a file with that header as is):
+Azure CLI, signed in with `az login` to the same subscription (`az rest` is used here because
+it can send the script file unchanged as the request body):
 
 ```powershell
 $rbUrl = "https://management.azure.com$rb"
@@ -504,7 +508,8 @@ users leaving in one run as well. Each former user also has a limit of
 then the configuration.
 
 1. **Remove the contacts.** Either empty the target group in steps of at most three users
-   and let a run clean up after each step, or temporarily set `MinimumTargetUsers = 0` and
+   and let a run clean up after each step (for the last one or two users you still need
+   `MinimumTargetUsers = 0`), or temporarily set `MinimumTargetUsers = 0` and
    `MaxFormerUsersPerRun` to the number of users (and `MaxFormerUserCleanupDeletes` above
    your list size if needed), empty the target group and start one run. Start it as a dry
    run first and check that every user shows `WOULD CLEANUP + REMOVE SCOPE`; then run it
@@ -534,9 +539,8 @@ then the configuration.
 
 4. **Remove the `Sites.Selected` grant** on the site
    (`DELETE /sites/{site-id}/permissions/{permission-id}`; find the permission ID with the
-   verify call from step 5). Microsoft Learn lists this call for the application permission
-   `Sites.FullControl.All` only; if your delegated session is refused, run it from an
-   app-only session with that permission.
+   verify call from step 5). This call does not support delegated permissions: run it from
+   an app-only session with the application permission `Sites.FullControl.All`.
 5. **Delete the Automation account.** This also deletes its system-assigned managed
    identity, and with it the Graph app role assignments from step 4.
 

@@ -303,9 +303,11 @@ Former users: `WOULD CLEANUP + REMOVE SCOPE` (dry run), `CLEANED + REMOVED SCOPE
 
 The safety stops (`MinimumTargetUsers`, `MaxFormerUsersPerRun`) also block a mass cleanup,
 on purpose. To remove the phonebook: empty the target group in steps, or temporarily lower
-`MinimumTargetUsers` and raise `MaxFormerUsersPerRun`, and let a run clean up the contacts (dry run first). Then remove the schedule,
-the runbook, the role assignments, the management scopes, the custom role, the scope group,
-the `Sites.Selected` grant and the Automation account. The commands are in
+`MinimumTargetUsers` and raise `MaxFormerUsersPerRun` (and `MaxFormerUserCleanupDeletes` if
+needed), and let a run clean up the contacts (dry run first). Then remove the schedule, the
+runbook, the role assignments, the role group, the custom role, the management scopes, the
+Exchange service principal, the scope group, the `Sites.Selected` grant, the alert and the
+Automation account. The commands are in
 [docs/SETUP.md](docs/SETUP.md#uninstall--roll-back).
 
 ## License
