@@ -5,6 +5,8 @@ names and phone numbers into the **personal Outlook contacts** of a group of use
 Because Teams shows a user's Outlook contacts under **People** and in **Calls**, every
 Teams Phone user gets the same central phonebook, maintained in one place.
 
+Background, design choices and pitfalls: [One phone book for everyone: under the hood](https://adyta.nl/en/engineering/one-phone-book-for-everyone/under-the-hood/).
+
 ## Why
 
 Microsoft Teams has no central, shared contact list for external numbers
