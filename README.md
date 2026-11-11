@@ -1,11 +1,25 @@
 # Central phonebook for Microsoft Teams
 
-A PowerShell runbook that mirrors a central SharePoint list (Microsoft List) of
-names and phone numbers into the **personal Outlook contacts** of a group of users.
+**Shared contacts for Microsoft Teams.** A PowerShell runbook that mirrors a central
+SharePoint list (Microsoft List) of names and phone numbers into the **personal Outlook
+contacts** of a group of users.
 Because Teams shows a user's Outlook contacts under **People** and in **Calls**, every
 Teams Phone user gets the same central phonebook, maintained in one place.
 
 Background, design choices and pitfalls: [One phone book for everyone: under the hood](https://adyta.nl/en/engineering/one-phone-book-for-everyone/under-the-hood/).
+
+## Requirements
+
+- Microsoft 365 with Exchange Online mailboxes for the target users (Teams shows contacts from the default contacts folder of the mailbox).
+- An Azure subscription for Azure Automation (PowerShell 7.4 runtime; modules Microsoft.Graph.Authentication, Microsoft.Graph.Groups, ExchangeOnlineManagement).
+- Admin rights to grant Microsoft Graph application permissions, a Sites.Selected site grant and Exchange Application RBAC.
+- A SharePoint site with a list of two text columns (name and phone number).
+
+## Quick start
+
+1. Create the list, the target group and the mail-enabled scope group ([docs/SETUP.md](docs/SETUP.md), step 1).
+2. Create the Automation account and grant the permissions ([docs/SETUP.md](docs/SETUP.md), steps 2-8).
+3. Import the runbook, run it as a **dry run** (the default), check the output, then schedule it with `DryRun = $false` ([docs/SETUP.md](docs/SETUP.md), steps 9-10).
 
 ## Why
 
@@ -22,19 +36,25 @@ every hour.
 
 ## Architecture
 
+Two flows meet in the runbook: **what** is synced (the data) and **to whom** (the users).
+
 ```
-SharePoint list "Central Phonebook"            (source, maintained by editors)
-        |
-Entra ID group (e.g. everyone with Teams Phone) (who gets the phonebook)
-        |  only RecipientTypeDetails = UserMailbox
-        v
-Mail-enabled security group "scope group"       (Exchange RBAC scope, mirrored by the script)
-        |
-Azure Automation runbook (hourly, managed identity)
-        |
-Personal contacts in each mailbox               (only contacts carrying our extension)
-        |
-Outlook / Teams People / Teams Calls
+WHAT                                         TO WHOM
+SharePoint list (source, editors)            Entra ID target group (e.g. Teams Phone users)
+        |                                            |  only RecipientTypeDetails = UserMailbox
+        |                                            v
+        |                                    Mail-enabled scope group (Exchange RBAC scope,
+        |                                    kept in sync by the script)
+        |                                            |
+        +-------------> Azure Automation runbook <---+
+                        (hourly, managed identity)
+                                  |
+                                  v
+              Personal contacts in each target mailbox
+              (only contacts carrying our extension are managed)
+                                  |
+                                  v
+                   Outlook / Teams People / Teams Calls
 ```
 
 Per run the script:
@@ -77,7 +97,7 @@ with the old name would no longer be recognised.
 | **CREATE** | The list item has no managed contact yet and no personal copy. |
 | **UPDATE** | A managed contact exists, but the name (case-sensitive) or number differs. |
 | **DELETE** | A managed contact whose sourceId is no longer in the list. |
-| **ADOPT** | The user already has a contact with the same name + number (case ignored) and there is no managed contact yet. That contact gets our extension and our spelling. A copy with different capitalisation is preferred, because the user typed it. The user's extra fields (e-mail, notes) are kept. |
+| **ADOPT** | The user already has a contact with the same name + number (case ignored) and there is no managed contact yet. That contact gets our extension and our spelling. A copy with different capitalisation is preferred, because the user typed it. The user's extra fields (email, notes) are kept; the business phone number follows the list from then on. |
 | **DUPDELETE** | After an ADOPT: remaining copies with **exactly** the list spelling are deleted. Copies with a different spelling are always kept. |
 
 Execution order: ADOPT, CREATE, UPDATE, DELETE, DUPDELETE. On an error the mailbox stops
@@ -105,12 +125,12 @@ Merging is controlled by `AdoptPersonalDuplicates` (ADOPT) and `DeleteExtraPerso
 | `MaxFormerUserCleanupDeletes` | 250 | More managed contacts at a former user: cleanup stops, the user stays in scope. |
 | `MaxLookalikeRatio` | 0.5 | If 50% or more of the source items already exist in a mailbox as contacts *without* our extension, extension detection is probably failing. The mailbox is skipped (otherwise merge would treat our own contacts as duplicates). |
 
-Furthermore:
+Also note:
 
 - An Exchange error during the mailbox check (e.g. throttling) aborts the whole run, so a
   temporary error never turns a valid user into a former user.
 - Target group and scope group are compared on Entra ID object ID
-  (`ExternalDirectoryObjectId`), not on UPN or e-mail address.
+  (`ExternalDirectoryObjectId`), not on UPN or email address.
 - Duplicate sourceIds in a mailbox: that mailbox is skipped.
 - A former user is removed from the scope group only after all managed contacts are gone
   and a re-read confirms nothing is left. Otherwise the RBAC access would disappear before
@@ -243,7 +263,7 @@ result table per mailbox, **All logs** shows the log lines.
 Former users: `WOULD CLEANUP + REMOVE SCOPE` (dry run), `CLEANED + REMOVED SCOPE`,
 `CLEANUP SAFETY STOP`, `ERROR CLEANUP` (stays in scope, retried next run).
 
-## Limitations and points of attention
+## Limitations and caveats
 
 - **Keep resource accounts and service accounts out of the target group where you can.**
   The script skips everything that is not a `UserMailbox`, but a cleaner target group is
@@ -254,6 +274,9 @@ Former users: `WOULD CLEANUP + REMOVE SCOPE` (dry run), `CLEANED + REMOVED SCOPE
   role whose write scope matches only the scope group.
 - **Do not manage the scope group by hand** and do not nest groups in it: Application RBAC
   only counts direct members.
+- **Leavers:** remove a user from the target group *before* removing their licence or
+  mailbox. If the mailbox can no longer be reached, cleanup ends as `ERROR CLEANUP`, the user
+  stays in the scope group and the job fails until it is sorted out.
 - **New users** are synced one run later: Exchange RBAC needs time to propagate after they
   are added to the scope group.
 - **Write-Host is not logged in Azure Automation**; enable verbose logging on the runbook.
