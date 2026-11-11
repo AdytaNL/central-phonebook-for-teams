@@ -1,0 +1,19 @@
+# Logs and exports
+*.log
+*.csv
+*.transcript.txt
+
+# Local settings (tenant values, parameter splats, credentials)
+*.local.ps1
+*.local.psd1
+*.local.json
+local.settings.json
+.env
+*.pfx
+*.cer
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

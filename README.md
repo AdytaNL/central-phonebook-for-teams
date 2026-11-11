@@ -1,0 +1,271 @@
+# Central phonebook for Microsoft Teams
+
+A PowerShell runbook that mirrors a central SharePoint list (Microsoft List) of
+names and phone numbers into the **personal Outlook contacts** of a group of users.
+Because Teams shows a user's Outlook contacts under **People** and in **Calls**, every
+Teams Phone user gets the same central phonebook, maintained in one place.
+
+## Why
+
+Microsoft Teams has no central, shared contact list for external numbers
+(suppliers, partners, on-call numbers, branch offices, and so on):
+
+- The organisation's address book (GAL) only contains directory objects. Org contacts
+  or a shared mailbox's contacts do not show up as contacts in Teams People or Calls.
+- What Teams *does* show are each user's own Outlook contacts.
+
+So this script takes a SharePoint list as the single source and keeps a copy of it in
+every target user's mailbox. Editors maintain the list; the script does the rest,
+every hour.
+
+## Architecture
+
+```
+SharePoint list "Central Phonebook"            (source, maintained by editors)
+        |
+Entra ID group (e.g. everyone with Teams Phone) (who gets the phonebook)
+        |  only RecipientTypeDetails = UserMailbox
+        v
+Mail-enabled security group "scope group"       (Exchange RBAC scope, mirrored by the script)
+        |
+Azure Automation runbook (hourly, managed identity)
+        |
+Personal contacts in each mailbox               (only contacts carrying our extension)
+        |
+Outlook / Teams People / Teams Calls
+```
+
+Per run the script:
+
+1. Reads the members of the target Entra ID group and keeps only real **UserMailboxes**.
+   Teams resource accounts and other objects without a user mailbox drop out.
+2. Reads the SharePoint list (a name column and a phone number column).
+3. Mirrors the Exchange scope group to the target group (adds new users first).
+4. Synchronises the contacts for every target user (see below).
+5. Cleans up the contacts of users who left the target group, and only after that
+   removes them from the scope group.
+
+## How managed contacts are recognised
+
+Every contact the script creates gets an Outlook **open extension**:
+
+| Field | Value |
+|---|---|
+| extensionName | the `-ExtensionName` parameter, e.g. `com.contoso.centralphonebook` |
+| id (as Graph returns it) | `Microsoft.OutlookServices.OpenTypeExtension.<extensionName>` |
+| sourceId | ID of the SharePoint list item |
+| sourceSystem | the `-ExtensionSourceSystem` parameter |
+
+The link between SharePoint and the mailbox is **only the sourceId**, never the name.
+Names and numbers can therefore change safely. Contacts without this extension are the
+user's own contacts and are not managed (except for the merge case below).
+
+Contacts are read with
+`$expand=extensions($filter=id eq 'Microsoft.OutlookServices.OpenTypeExtension.<extensionName>')`.
+Graph does not allow `$expand=extensions` on Outlook contacts without such a filter
+(`ErrorGraphExtensionExpandRequiresFilter`).
+
+Pick your own reverse-domain extension name and never change it after go-live: contacts
+with the old name would no longer be recognised.
+
+## Actions per mailbox
+
+| Action | When |
+|---|---|
+| **CREATE** | The list item has no managed contact yet and no personal copy. |
+| **UPDATE** | A managed contact exists, but the name (case-sensitive) or number differs. |
+| **DELETE** | A managed contact whose sourceId is no longer in the list. |
+| **ADOPT** | The user already has a contact with the same name + number (case ignored) and there is no managed contact yet. That contact gets our extension and our spelling. A copy with different capitalisation is preferred, because the user typed it. The user's extra fields (e-mail, notes) are kept. |
+| **DUPDELETE** | After an ADOPT: remaining copies with **exactly** the list spelling are deleted. Copies with a different spelling are always kept. |
+
+Execution order: ADOPT, CREATE, UPDATE, DELETE, DUPDELETE. On an error the mailbox stops
+immediately, so duplicates are never deleted after a failed adopt.
+
+A list item with an empty name or number is skipped, but its existing contact is **not**
+deleted.
+
+Note: an adopted contact is a managed contact from then on. If the item disappears from
+the list, the contact is deleted at that user, including the user's own extra fields.
+
+Merging is controlled by `AdoptPersonalDuplicates` (ADOPT) and `DeleteExtraPersonalDuplicates`
+(DUPDELETE), both `$true` by default. Set them to `$false` to leave personal copies alone.
+
+## Safety stops (fail closed)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `DryRun` | `$true` | Read and report only. |
+| `MinimumTargetUsers` | 2 | Fewer valid target users: the whole run stops. |
+| `MinimumSourceContacts` | 1 | Fewer valid list items: the whole run stops. **Set this to a value somewhat below the normal size of your list** (for example 80 for a list of about 100), so that an empty or truncated source never leads to mass deletes. |
+| `MaxDeletesPerMailbox` | 25 | More DELETEs in one mailbox: that mailbox is skipped. |
+| `MaxPersonalDuplicateDeletesPerMailbox` | 25 | More DUPDELETEs in one mailbox: that mailbox is skipped. |
+| `MaxFormerUsersPerRun` | 3 | More users leaving the target group in one run: the whole run stops. |
+| `MaxFormerUserCleanupDeletes` | 250 | More managed contacts at a former user: cleanup stops, the user stays in scope. |
+| `MaxLookalikeRatio` | 0.5 | If 50% or more of the source items already exist in a mailbox as contacts *without* our extension, extension detection is probably failing. The mailbox is skipped (otherwise merge would treat our own contacts as duplicates). |
+
+Furthermore:
+
+- An Exchange error during the mailbox check (e.g. throttling) aborts the whole run, so a
+  temporary error never turns a valid user into a former user.
+- Target group and scope group are compared on Entra ID object ID
+  (`ExternalDirectoryObjectId`), not on UPN or e-mail address.
+- Duplicate sourceIds in a mailbox: that mailbox is skipped.
+- A former user is removed from the scope group only after all managed contacts are gone
+  and a re-read confirms nothing is left. Otherwise the RBAC access would disappear before
+  cleanup and cleanup would no longer be possible.
+- If a mailbox or former user ends with an error status, or a scope change fails, the
+  script ends with an exception. The Automation job is then **Failed**, which you can alert
+  on. Transient statuses (RBAC propagation of a new user) do not count as an error.
+
+## Permission model (least privilege)
+
+The script runs as the **system-assigned managed identity** of a dedicated Azure
+Automation account. There is no tenant-wide `Contacts.ReadWrite` and no Exchange
+administrator role.
+
+| Where | Permission | Purpose |
+|---|---|---|
+| Microsoft Graph (application) | `Sites.Selected` + `read` on one site | Read the phonebook list, nothing else in SharePoint |
+| Microsoft Graph (application) | `GroupMember.ReadBasic.All` | Read members of the target group |
+| Microsoft Graph (application) | `User.ReadBasic.All` | Name / UPN of the members |
+| Office 365 Exchange Online (application) | `Exchange.ManageAsApp` | Connect to Exchange Online unattended (grants no Exchange rights by itself) |
+| Exchange Application RBAC | `Application Contacts.ReadWrite` with a management scope `MemberOfGroup` = scope group | Read/write contacts, only in mailboxes of scope group members |
+| Exchange role group | `View-Only Recipients` | `Get-EXOMailbox`, `Get-DistributionGroupMember` |
+| Exchange role group | Custom role derived from *Security Group Creation and Membership* with only `Add-/Remove-DistributionGroupMember`, with a write scope that matches only the scope group | Manage the members of the scope group and nothing else (with `-BypassSecurityGroupManagerCheck`) |
+
+Why a separate scope group? Exchange Application RBAC scopes mailboxes with a management
+scope. `MemberOfGroup` only counts **direct** members of a mail-enabled group, so the script
+keeps a flat technical group in sync with your (possibly dynamic) target group. Only **direct**
+user members of the target group are read, so do not rely on nested groups there.
+
+Use a dedicated Automation account: the managed identity's permissions apply to every
+runbook in that account.
+
+## Installation
+
+See [docs/SETUP.md](docs/SETUP.md) for the step-by-step setup with PowerShell examples:
+Automation account, modules, Graph permissions, the SharePoint site grant, Exchange
+Application RBAC, the custom role, the runbook, the schedule and an alert.
+
+### SharePoint list
+
+Create a Microsoft List with two text columns, for example **Name** and **Phone**
+(the column display names are parameters). Store phone numbers as text so a leading zero
+or `+` is kept. Give only the phonebook editors edit rights on the list.
+
+## Parameters
+
+| Parameter | Required | Example / default |
+|---|---|---|
+| `Organization` | yes | `contoso.onmicrosoft.com` |
+| `TeamsPhoneGroupId` | yes | `00000000-0000-0000-0000-000000000000` |
+| `ScopeGroup` | yes | `Phonebook Sync Users` |
+| `SharePointHost` | yes | `contoso.sharepoint.com` |
+| `SharePointPath` | yes | `/sites/Intranet` |
+| `ListName` | yes | `Central Phonebook` |
+| `NameColumnName` | no | `Name` |
+| `PhoneColumnName` | no | `Phone` |
+| `ExtensionName` | no | `com.contoso.centralphonebook` (use your own) |
+| `ExtensionSourceSystem` | no | `Central Phonebook` |
+| `DryRun` | no | `$true` |
+| `ManagedIdentity` | no | `$false` (use `$true` in Azure Automation) |
+| `FunctionsOnly` | no | switch |
+| Safety limits | no | see the table above |
+
+## Testing locally
+
+Connect yourself first: Microsoft Graph **app-only** (delegated sessions are refused) with
+an identity that has the same Graph permissions, and `Connect-ExchangeOnline`. The
+identity that reads and writes contacts also needs an Exchange Application RBAC assignment
+(`Application Contacts.ReadWrite` within the same management scope).
+
+```powershell
+$p = @{
+    Organization      = "contoso.onmicrosoft.com"
+    TeamsPhoneGroupId = "00000000-0000-0000-0000-000000000000"
+    ScopeGroup        = "Phonebook Sync Users"
+    SharePointHost    = "contoso.sharepoint.com"
+    SharePointPath    = "/sites/Intranet"
+    ListName          = "Central Phonebook"
+}
+
+# Dry run (default): reads and reports, changes nothing
+.\Sync-CentralPhonebook.ps1 @p
+
+# Live
+.\Sync-CentralPhonebook.ps1 @p -DryRun $false
+
+# Load only the functions, e.g. to inspect one mailbox
+. .\Sync-CentralPhonebook.ps1 @p -FunctionsOnly
+@(Get-ManagedContacts -UserPrincipalName "<user UPN>").Count
+```
+
+The mandatory parameters are required with `-FunctionsOnly` too. Pass booleans as
+`$true`/`$false` (e.g. `-DryRun $false`); the string `false` gives a binding error.
+
+Dot-sourcing also sets `Set-StrictMode -Version Latest` and `$ErrorActionPreference = 'Stop'`
+in your own session.
+
+Always start with a dry run and read the planned CREATE / UPDATE / DELETE / ADOPT /
+DUPDELETE lines before running live.
+
+## Azure Automation
+
+- Runtime: PowerShell 7.4 runtime environment with `Microsoft.Graph.Authentication`,
+  `Microsoft.Graph.Groups` and `ExchangeOnlineManagement`.
+- Runbook: the content of `Sync-CentralPhonebook.ps1`, with **verbose logging enabled**.
+- Schedule: for example every hour, with `ManagedIdentity = true`, `DryRun = false` and the
+  environment parameters.
+- Alert: a metric alert on `TotalJob` for this runbook with status Failed, Suspended or
+  Stopped.
+
+Azure Automation does not capture `Write-Host`. With `-ManagedIdentity $true` the script
+therefore writes its log lines to the Verbose stream (and warnings/errors also to the
+Warning stream). Module noise from Graph/EXO is suppressed. In the job: **Output** shows the
+result table per mailbox, **All logs** shows the log lines.
+
+### Statuses per mailbox
+
+| Status | Meaning |
+|---|---|
+| `OK` | Synchronised |
+| `SCOPE ADD REQUIRED` | Dry run: the user would be added to the scope group |
+| `RBAC PROPAGATION PENDING` / `RBAC pending / 403` | Just added; Exchange RBAC not active yet. The next run picks the user up. |
+| `ERROR reading contacts` | Graph error while reading (the Graph error code is in the log) |
+| `ERROR duplicate SourceId` | Two managed contacts with the same sourceId; remove one by hand |
+| `SAFETY STOP lookalikes (n)` | Many contacts without our extension that match the source; check extension detection |
+| `DELETE SAFETY STOP` | Too many deletes; check the list |
+| `DUPLICATE DELETE SAFETY STOP` | Too many personal duplicates; check the mailbox |
+| `ERROR during sync` | Error halfway; see the log |
+
+Former users: `WOULD CLEANUP + REMOVE SCOPE` (dry run), `CLEANED + REMOVED SCOPE`,
+`CLEANUP SAFETY STOP`, `ERROR CLEANUP` (stays in scope, retried next run).
+
+## Limitations and points of attention
+
+- **Keep resource accounts and service accounts out of the target group where you can.**
+  The script skips everything that is not a `UserMailbox`, but a cleaner target group is
+  better. If you use a dynamic group, add for example `(user.accountEnabled -eq true)` to
+  the rule so disabled accounts drop out.
+- **A managed identity cannot be the owner (ManagedBy) of a group.** That is why the
+  script uses `-BypassSecurityGroupManagerCheck`, allowed only through the narrow custom
+  role whose write scope matches only the scope group.
+- **Do not manage the scope group by hand** and do not nest groups in it: Application RBAC
+  only counts direct members.
+- **New users** are synced one run later: Exchange RBAC needs time to propagate after they
+  are added to the scope group.
+- **Write-Host is not logged in Azure Automation**; enable verbose logging on the runbook.
+- Deleting a list item removes the contact for **all** users. Restore an item from the
+  site's recycle bin: it keeps its ID and the contact comes back on the next run.
+- Do not rename the list columns without updating the parameters: a missing column stops
+  the sync.
+- Only the default contacts folder is read and written; only the first business phone
+  number is used.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+## Author
+
+Built by Adyta (Lambert van der Plas) – https://adyta.nl
