@@ -18,6 +18,8 @@ Overview:
 9. Runbook: import, publish, test, schedule
 10. Alert on failed jobs
 
+To remove everything again, see [Uninstall / roll back](#uninstall--roll-back).
+
 Placeholders used:
 
 | Placeholder | Meaning |
@@ -56,6 +58,12 @@ Get-DistributionGroup "Phonebook Sync Users" |
 ```
 
 Note the `PrimarySmtpAddress` (`<scope-group-smtp>`) and the `DistinguishedName`.
+
+Tip: the scope group is a technical group, so hide it from the address list:
+
+```powershell
+Set-DistributionGroup "Phonebook Sync Users" -HiddenFromAddressListsEnabled $true
+```
 
 **SharePoint list**: a Microsoft List (e.g. *Central Phonebook* on `/sites/Intranet`) with
 two single-line text columns, e.g. **Name** and **Phone**. Give the phonebook editors
@@ -210,6 +218,29 @@ Invoke-MgGraphRequest -Method POST `
 
 Note: `grantedToIdentities` takes the **application (client) ID**, not the object ID.
 
+**Revoke the consent afterwards.** `Sites.FullControl.All` is only needed for this one call.
+If you consented for the whole organisation, revoke it in the Microsoft Entra admin center:
+Enterprise apps > *Microsoft Graph Command Line Tools* > Permissions > Admin consent >
+`...` next to the permission > Revoke permission. Consent for your own account only (the
+User consent tab) cannot be revoked in the portal; remove the scope from the grant with
+PowerShell instead:
+
+```powershell
+Connect-MgGraph -Scopes "DelegatedPermissionGrant.ReadWrite.All"
+
+# Microsoft Graph Command Line Tools (the client behind Connect-MgGraph)
+$cli = Get-MgServicePrincipal -Filter "appId eq '14d82eec-204b-4c2f-b7e8-296a70dab67e'"
+
+Get-MgOauth2PermissionGrant -Filter "clientId eq '$($cli.Id)'" -All |
+    Where-Object { ($_.Scope -split ' ') -contains 'Sites.FullControl.All' } |
+    Format-List Id, ConsentType, PrincipalId, Scope
+
+# For the grant you created in this step: keep the other scopes, drop Sites.FullControl.All
+$g     = Get-MgOauth2PermissionGrant -OAuth2PermissionGrantId "<grant-id>"
+$scope = (($g.Scope -split ' ') | Where-Object { $_ -and $_ -ne 'Sites.FullControl.All' }) -join ' '
+Update-MgOauth2PermissionGrant -OAuth2PermissionGrantId $g.Id -BodyParameter @{ scope = $scope }
+```
+
 ---
 
 ## 6. Exchange: service principal
@@ -344,7 +375,8 @@ Invoke-AzRestMethod -Method PUT -Path "$rb`?$api" -Payload (@{
 ```
 
 Upload the script as draft content (content type `text/powershell`) and publish. With the
-Azure CLI:
+Azure CLI (`az rest` is used here because this call needs the raw script file as the request
+body with content type `text/powershell`, and `az rest` sends a file with that header as is):
 
 ```powershell
 $rbUrl = "https://management.azure.com$rb"
@@ -460,6 +492,60 @@ Invoke-AzRestMethod -Method PUT `
         }
     } | ConvertTo-Json -Depth 10)
 ```
+
+---
+
+## Uninstall / roll back
+
+The safety stops also block a mass cleanup: with fewer than `MinimumTargetUsers` (default 2)
+valid target users the whole run stops, and with more than `MaxFormerUsersPerRun` (default 3)
+users leaving in one run as well. Each former user also has a limit of
+`MaxFormerUserCleanupDeletes` (default 250) managed contacts. So remove the contacts first,
+then the configuration.
+
+1. **Remove the contacts.** Either empty the target group in steps of at most three users
+   and let a run clean up after each step, or temporarily set `MinimumTargetUsers = 0` and
+   `MaxFormerUsersPerRun` to the number of users (and `MaxFormerUserCleanupDeletes` above
+   your list size if needed), empty the target group and start one run. Start it as a dry
+   run first and check that every user shows `WOULD CLEANUP + REMOVE SCOPE`; then run it
+   live and check for `CLEANED + REMOVED SCOPE`. Adopted contacts are managed contacts, so
+   they are removed too.
+2. **Remove the schedule and the runbook**, so nothing runs against a half-removed setup:
+
+   ```powershell
+   Remove-AzAutomationSchedule -ResourceGroupName <resource-group> -AutomationAccountName <automation-account> -Name "Hourly - Central Phonebook" -Force
+   Remove-AzAutomationRunbook  -ResourceGroupName <resource-group> -AutomationAccountName <automation-account> -Name Sync-CentralPhonebook -Force
+   ```
+
+3. **Remove the Exchange configuration.** Role assignments go before the scopes and the
+   custom role; removing the role group also removes its role assignments.
+
+   ```powershell
+   Connect-ExchangeOnline -Organization <tenant>
+
+   Remove-ManagementRoleAssignment "Central Phonebook Contacts RW" -Confirm:$false
+   Remove-RoleGroup "Phonebook Sync Management" -Confirm:$false
+   Remove-ManagementRole "Phonebook Scope Group Members" -Confirm:$false
+   Remove-ManagementScope "Phonebook Sync Scope" -Confirm:$false
+   Remove-ManagementScope "Phonebook Scope Group Only" -Confirm:$false
+   Remove-ServicePrincipal -Identity "<mi-app-id>" -Confirm:$false
+   Remove-DistributionGroup "Phonebook Sync Users" -Confirm:$false
+   ```
+
+4. **Remove the `Sites.Selected` grant** on the site
+   (`DELETE /sites/{site-id}/permissions/{permission-id}`; find the permission ID with the
+   verify call from step 5). Microsoft Learn lists this call for the application permission
+   `Sites.FullControl.All` only; if your delegated session is refused, run it from an
+   app-only session with that permission.
+5. **Delete the Automation account.** This also deletes its system-assigned managed
+   identity, and with it the Graph app role assignments from step 4.
+
+   ```powershell
+   Remove-AzAutomationAccount -ResourceGroupName <resource-group> -Name <automation-account> -Force
+   ```
+
+   Remove the alert rule and action group from step 10 as well, or the whole resource group
+   if it holds nothing else.
 
 ---
 

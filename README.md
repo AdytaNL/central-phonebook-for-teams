@@ -201,6 +201,18 @@ an identity that has the same Graph permissions, and `Connect-ExchangeOnline`. T
 identity that reads and writes contacts also needs an Exchange Application RBAC assignment
 (`Application Contacts.ReadWrite` within the same management scope).
 
+In practice that identity is an app registration with a certificate, set up like the
+managed identity in [docs/SETUP.md](docs/SETUP.md):
+
+- the same app roles (step 4) and its own read grant on the site (step 5);
+- an Exchange service principal for it (step 6, with the app's application ID and the
+  object ID of its Enterprise application);
+- the same role assignment in the same management scope (step 7), and membership of the
+  role group from step 8 if you also run the scope group changes locally.
+
+Then connect with `Connect-MgGraph -ClientId <app-id> -TenantId <tenant> -CertificateThumbprint <thumbprint>`
+and `Connect-ExchangeOnline -AppId <app-id> -Organization <tenant> -CertificateThumbprint <thumbprint>`.
+
 ```powershell
 $p = @{
     Organization      = "contoso.onmicrosoft.com"
@@ -286,6 +298,15 @@ Former users: `WOULD CLEANUP + REMOVE SCOPE` (dry run), `CLEANED + REMOVED SCOPE
   the sync.
 - Only the default contacts folder is read and written; only the first business phone
   number is used.
+
+## Uninstall / roll back
+
+The safety stops (`MinimumTargetUsers`, `MaxFormerUsersPerRun`) also block a mass cleanup,
+on purpose. To remove the phonebook: empty the target group in steps, or temporarily lower
+`MinimumTargetUsers` and raise `MaxFormerUsersPerRun`, and let a run clean up the contacts (dry run first). Then remove the schedule,
+the runbook, the role assignments, the management scopes, the custom role, the scope group,
+the `Sites.Selected` grant and the Automation account. The commands are in
+[docs/SETUP.md](docs/SETUP.md#uninstall--roll-back).
 
 ## License
 

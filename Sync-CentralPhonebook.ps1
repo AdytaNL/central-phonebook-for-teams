@@ -30,7 +30,8 @@
     - Creates missing contacts.
     - Updates existing centrally managed contacts.
     - Deletes centrally managed contacts that were removed from SharePoint.
-    - Never touches users' personal contacts.
+    - Never touches personal contacts, except when merging copies of list
+      items (see AdoptPersonalDuplicates).
     - Cleans up contacts for users who leave the target group.
     - Only after that removes a former target user from the RBAC scope group.
     - Contains several safety stops against unintended mass deletes.
