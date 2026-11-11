@@ -379,8 +379,8 @@ Start-AzAutomationRunbook `
 
 In the first dry run every user shows `SCOPE ADD REQUIRED`. Check the planned actions in
 the job's **All logs**. Then run live once (`DryRun = $false`): users are added to the scope
-group and show `RBAC PROPAGATION PENDING`. After RBAC has propagated (can take up to an hour
-or longer) the next run creates the contacts.
+group and show `RBAC PROPAGATION PENDING`. After RBAC has propagated (typically 30 minutes to
+two hours) the next run creates the contacts.
 
 **Schedule** (e.g. hourly):
 
